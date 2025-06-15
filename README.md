@@ -88,7 +88,6 @@ Pipe any command output to `eo` to enhance and analyze it:
 command | eo
 ```
 
-2
 ### Custom Ollama URL
 To use a custom Ollama service URL (saved to `/etc/eo/config.txt`):
 ```bash
