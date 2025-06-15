@@ -9,9 +9,22 @@
 #include "nlohmann/json.hpp" // JSON Library: External library for parsing and manipulating JSON data
 #include <unistd.h>     // POSIX API: Provides access to POSIX system calls (e.g., sleep, getpid) for Unix-like systems
 #include <cstdlib>      // C Standard Library: Includes functions for general utilities (e.g., rand, exit, atoi)
+#include <sys/ioctl.h>  // System I/O Control: Provides access to terminal size information
 
 // Define an enumeration for supported input formats
 enum class Format { JSON, TABLE, PLAIN_TEXT };
+
+/**
+ * @brief Retrieves the current terminal width in characters.
+ * @return The number of characters that fit in the terminal width, or a default value (80) if unable to retrieve.
+ */
+int get_terminal_width() {
+    struct winsize w;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == -1) {
+        return 80; // Default width if retrieval fails
+    }
+    return w.ws_col;
+}
 
 /**
  * @brief Displays the help message for the program.
@@ -92,25 +105,29 @@ Format detect_format(const std::string& input) {
 }
 
 /**
- * @brief Formats JSON input with proper indentation.
+ * @brief Formats JSON input with proper indentation, respecting terminal width.
  * @param input The raw JSON string.
+ * @param terminal_width The width of the terminal in characters.
  * @return A formatted JSON string or an error message if invalid.
  */
-std::string format_json(const std::string& input) {
+std::string format_json(const std::string& input, int terminal_width) {
     try {
         auto j = nlohmann::json::parse(input);
-        return j.dump(4); // Indent with 4 spaces
+        // Adjust indentation based on terminal width (e.g., use 2 spaces if terminal is narrow)
+        int indent = terminal_width < 100 ? 2 : 4;
+        return j.dump(indent);
     } catch (const nlohmann::json::exception& e) {
         return "Error: Invalid JSON ─ " + std::string(e.what());
     }
 }
 
 /**
- * @brief Formats table input into a neatly aligned table.
+ * @brief Formats table input into a neatly aligned table, respecting terminal width.
  * @param input The raw table string.
+ * @param terminal_width The width of the terminal in characters.
  * @return A formatted table string with aligned columns.
  */
-std::string format_table(const std::string& input) {
+std::string format_table(const std::string& input, int terminal_width) {
     std::istringstream iss(input);
     std::string line;
     std::vector<std::vector<std::string>> rows;
@@ -129,7 +146,7 @@ std::string format_table(const std::string& input) {
     }
     if (rows.empty()) return "";
 
-    // Calculate maximum width for each column
+    // Calculate maximum width for each column, ensuring total width fits terminal
     std::vector<size_t> col_widths(rows[0].size(), 0);
     for (const auto& row : rows) {
         for (size_t i = 0; i < row.size(); ++i) {
@@ -137,11 +154,23 @@ std::string format_table(const std::string& input) {
         }
     }
 
+    // Adjust column widths to fit within terminal width
+    size_t total_width = 0;
+    for (size_t w : col_widths) total_width += w + 2; // +2 for padding
+    if (total_width > static_cast<size_t>(terminal_width)) {
+        size_t excess = total_width - terminal_width + col_widths.size(); // Account for padding
+        size_t reduce_per_col = excess / col_widths.size() + 1;
+        for (size_t& w : col_widths) {
+            w = std::max<size_t>(w - reduce_per_col, 5); // Ensure minimum width of 5
+        }
+    }
+
     // Build formatted table output
     std::stringstream ss;
     for (size_t i = 0; i < rows.size(); ++i) {
         for (size_t j = 0; j < rows[i].size(); ++j) {
-            ss << std::left << std::setw(col_widths[j] + 2) << rows[i][j];
+            std::string cell = rows[i][j].substr(0, col_widths[j]); // Truncate if too long
+            ss << std::left << std::setw(col_widths[j] + 2) << cell;
         }
         ss << '\n';
     }
@@ -232,9 +261,10 @@ std::string unescape_string(const std::string& input) {
  * @param prompt The prompt to send to the AI model.
  * @param url The Ollama service URL.
  * @param models JSON object containing available models.
+ * @param terminal_width The width of the terminal in characters.
  * @return The AI-enhanced response or an error message.
  */
-std::string enhance_with_ai(const std::string& prompt, const std::string& url, const nlohmann::json& models) {
+std::string enhance_with_ai(const std::string& prompt, const std::string& url, const nlohmann::json& models, int terminal_width) {
     httplib::Client cli(url);
     
     // Select the first available model from the models list
@@ -246,10 +276,10 @@ std::string enhance_with_ai(const std::string& prompt, const std::string& url, c
         return "Error: No models available";
     }
 
-    // Prepare the payload for the AI request
+    // Prepare the payload for the AI request, including terminal width
     nlohmann::json payload = {
         {"model", model_name},
-        {"prompt", prompt},
+        {"prompt", prompt + "\n\nThe terminal width is " + std::to_string(terminal_width) + " characters. Ensure the output is formatted to fit within this width for symmetry and readability."},
         {"stream", false}
     };
 
@@ -279,6 +309,13 @@ std::string enhance_with_ai(const std::string& prompt, const std::string& url, c
         std::regex note_regex("\n*Note:.*$", std::regex::multiline);
         response = std::regex_replace(response, note_regex, "");
 
+        // Remove triple backticks and their contents (including language specifiers and edge cases)
+        std::regex backtick_regex("```[a-zA-Z0-9]*\\n?[^`]*?```", std::regex::multiline);
+        response = std::regex_replace(response, backtick_regex, "");
+        // Remove standalone, partial, or empty backticks
+        std::regex standalone_backtick_regex("```[a-zA-Z0-9]*\\n?|\\n?```", std::regex::multiline);
+        response = std::regex_replace(response, standalone_backtick_regex, "");
+
         // Apply ANSI formatting for bold text
         std::regex bold_regex("\\*\\*([^\\*]+)\\*\\*");
         response = std::regex_replace(response, bold_regex, "\033[1m$1\033[0m");
@@ -291,7 +328,8 @@ std::string enhance_with_ai(const std::string& prompt, const std::string& url, c
             {"blue", "\033[34m"}
         };
         for (const auto& [color, code] : color_codes) {
-            std::regex color_bold_regex(color + "\\[\\*\\*([^\\*]+)\\*\\*\\]");
+            // Corrected regex: matches color[**text**] (e.g., yellow[**All Clear!**])
+            std::regex color_bold_regex(color + "\\$$   \\*\\*([^\\*]+)\\*\\*\\   $$", std::regex::multiline);
             response = std::regex_replace(response, color_bold_regex, code + "\033[1m$1\033[0m");
         }
 
@@ -306,6 +344,10 @@ std::string enhance_with_ai(const std::string& prompt, const std::string& url, c
         response = std::regex_replace(response, table_row_end, "");
         std::regex table_cell_divider(" \\| ");
         response = std::regex_replace(response, table_cell_divider, "  ");
+
+        // Trim leading/trailing whitespace
+        response.erase(0, response.find_first_not_of(" \n\r\t"));
+        response.erase(response.find_last_not_of(" \n\r\t") + 1);
 
         return response;
     } catch (const nlohmann::json::exception& e) {
@@ -323,6 +365,7 @@ std::string enhance_with_ai(const std::string& prompt, const std::string& url, c
 int main(int argc, char* argv[]) {
     bool use_colors = true; // Enable color output by default
     std::string url = "http://localhost:11434"; // Default URL
+    int terminal_width = get_terminal_width(); // Get terminal width
 
     // Check for --help or -h
     for (int i = 1; i < argc; ++i) {
@@ -354,19 +397,19 @@ int main(int argc, char* argv[]) {
     std::string formatted_output;
     std::string ai_prompt;
 
-	// Handle input based on detected format
-	if (format == Format::JSON) {
-	    formatted_output = format_json(input);
-	    ai_prompt = "Act as a data analyst !(do NOT talk to me). Transform the provided JSON data into a highly readable and visually appealing format suitable for a terminal, summarizing the information and removing unnecessary data. Use ANSI escape codes for formatting (e.g., \\033[31m for red, \\033[32m for green, \\033[33m for yellow, \\033[34m for blue, \\033[1m for bold, \\033[0m to reset). For text wrapped in ** (e.g., **something**), apply bold formatting. For text prefixed with a color name followed by [**text**] (e.g., yellow[**All Clear!**]), apply the specified color and bold formatting. Supported colors are red (\\033[31m), green (\\033[32m), yellow (\\033[33m), blue (\\033[34m). Use icons (e.g., ★, ►, ✔) or emojis for clarity. Do not use markdown code blocks or any markdown formatting; output plain text with ANSI codes only. At the end, append a concise analysis of the data, including key points, patterns, trends, or notable observations, and provide the AI's opinions or interpretations of the data's implications. Here's the data:\n\n" + input;
-	} else if (format == Format::TABLE) {
-	    formatted_output = format_table(input);
-	    ai_prompt = "Act as a data analyst !(do NOT talk to me). Transform the provided table data into a highly readable and visually appealing format suitable for a terminal, summarizing the information and removing unnecessary data. Use ANSI escape codes for formatting (e.g., \\033[31m for red, \\033[32m for green, \\033[33m for yellow, \\033[34m for blue, \\033[1m for bold, \\033[0m to reset). For text wrapped in ** (e.g., **something**), apply bold formatting. For text prefixed with a color name followed by [**text**] (e.g., yellow[**All Clear!**]), apply the specified color and bold formatting. Supported colors are red (\\033[31m), green (\\033[32m), yellow (\\033[33m), blue (\\033[34m). Use icons (e.g., ★, ►, ✔) or emojis for clarity. Do not use markdown code blocks or any markdown formatting; output plain text with ANSI codes only. At the end, append a concise analysis of the data, including key points, patterns, trends, or notable observations, and provide the AI's opinions or interpretations of the data's implications. Here's the data:\n\n" + input;
-	} else {
-	    ai_prompt = "Act as a command-line output enhancer !(do NOT talk to me). Transform the raw output from a command into a highly readable and visually appealing format suitable for a terminal, summarizing the information and removing unnecessary data. Use ANSI escape codes for formatting (e.g., \\033[31m for red, \\033[32m for green, \\033[33m for yellow, \\033[34m for blue, \\033[1m for bold, \\033[0m to reset). For text wrapped in ** (e.g., **something**), apply bold formatting. For text prefixed with a color name followed by [**text**] (e.g., yellow[**All Clear!**]), apply the specified color and bold formatting. Supported colors are red (\\033[31m), green (\\033[32m), yellow (\\033[33m), blue (\\033[34m). Use icons (e.g., ★, ►, ✔) or emojis for clarity. Do not use markdown code blocks or any markdown formatting; output plain text with ANSI codes only. Here's the output to enhance:\n\n" + input;
-	}
+    // Handle input based on detected format
+    if (format == Format::JSON) {
+        formatted_output = format_json(input, terminal_width);
+        ai_prompt = "Act as a data analyst !(do NOT talk to me; ej:'Here's your....). Transform the provided JSON data into a highly readable and visually appealing format suitable for a terminal, summarizing the information and removing unnecessary data. Use ANSI escape codes according to your criteria in the output for formatting (e.g., \\033[31m for red, \\033[32m for green, \\033[33m for yellow, \\033[34m for blue, \\033[1m for bold, \\033[0m to reset). For text wrapped in ** (e.g., **something**), apply bold formatting. For text prefixed with a color name followed by [**text**] (e.g., yellow[**All Clear!**]), apply the specified color and bold formatting. Supported colors are red (\\033[31m), green (\\033[32m), yellow (\\033[33m), blue (\\033[34m). Use icons (e.g., ★, ►, ✔) or emojis for clarity. Do not use markdown code blocks or any markdown formatting; output plain text with ANSI codes only !(Do NOT give icon legends). At the end, append a concise analysis of the data, including key points, patterns, trends, or notable observations, and provide the AI's opinions or interpretations of the data's implications. The terminal width is " + std::to_string(terminal_width) + " characters. Ensure the output is formatted to fit within this width for symmetry and readability. Here's the data:\n\n" + input;
+    } else if (format == Format::TABLE) {
+        formatted_output = format_table(input, terminal_width);
+        ai_prompt = "Act as a data analyst !(do NOT talk to me; ej:'Here's your....). Transform the provided table data into a highly readable and visually appealing format suitable for a terminal, summarizing the information and removing unnecessary data. Use ANSI escape codes according to your criteria in the output for formatting (e.g., \\033[31m for red, \\033[32m for green, \\033[33m for yellow, \\033[34m for blue, \\033[1m for bold, \\033[0m to reset). For text wrapped in ** (e.g., **something**), apply bold formatting. For text prefixed with a color name followed by [**text**] (e.g., yellow[**All Clear!**]), apply the specified color and bold formatting. Supported colors are red (\\033[31m), green (\\033[32m), yellow (\\033[33m), blue (\\033[34m). Use icons (e.g., ★, ►, ✔) or emojis for clarity. Do not use markdown code blocks or any markdown formatting; output plain text with ANSI codes only !(Do NOT give icon legends). At the end, append a concise analysis of the data, including key points, patterns, trends, or notable observations, and provide the AI's opinions or interpretations of the data's implications. The terminal width is " + std::to_string(terminal_width) + " characters. Ensure the output is formatted to fit within this width for symmetry and readability. Here's the data:\n\n" + input;
+    } else {
+        ai_prompt = "Act as a command-line output enhancer !(do NOT talk to me; ej:'Here's your....). Transform the raw output from a command into a highly readable and visually appealing format suitable for a terminal, summarizing the information and removing unnecessary data. Use ANSI escape codes according to your criteria in the output for formatting (e.g., \\033[31m for red, \\033[32m for green, \\033[33m for yellow, \\033[34m for blue, \\033[1m for bold, \\033[0m to reset). For text wrapped in ** (e.g., **something**), apply bold formatting. For text prefixed with a color name followed by [**text**] (e.g., yellow[**All Clear!**]), apply the specified color and bold formatting. Supported colors are red (\\033[31m), green (\\033[32m), yellow (\\033[33m), blue (\\033[34m). Use icons (e.g., ★, ►, ✔) or emojis for clarity. Do not use markdown code blocks or any markdown formatting; output plain text with ANSI codes only !(Do NOT give icon legends). The terminal width is " + std::to_string(terminal_width) + " characters. Ensure the output is formatted to fit within this width for symmetry and readability. Here's the output to enhance:\n\n" + input;
+    }
 
     // Get AI-enhanced response
-    std::string ai_response = enhance_with_ai(ai_prompt, url, models);
+    std::string ai_response = enhance_with_ai(ai_prompt, url, models, terminal_width);
 
     // Output results based on format
     if (format == Format::JSON || format == Format::TABLE) {
