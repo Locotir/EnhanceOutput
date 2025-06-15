@@ -101,6 +101,15 @@ cat data.json | eo --url=http://custom-url:11434
 - **Color Output**: Enabled by default for all environments, using ANSI escape codes for bold and colored text.
 - **Default Model**: Uses `llama3:8b-instruct-q4_0` if no models are specified by Ollama.
 
+## 🖼️ Visual Example Results
+
+### Without EnhanceOutput
+![image](https://github.com/user-attachments/assets/6df6d04e-686b-4df4-a42a-05f064d287c5)
+
+### With EnhanceOutput
+![image](https://github.com/user-attachments/assets/fc8fda66-c704-4d8e-8988-57219080a893)
+
+
 ## 📝 Notes
 
 - **Ollama Service**: Ensure Ollama is running before using `eo`. Test with:
